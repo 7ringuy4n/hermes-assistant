@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""Unit tests for scenic Omni image-gen helpers (media_shortcuts)."""
+from __future__ import annotations
+
+import importlib.util
+import base64
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "hermes" / "main" / "plugins" / "zalo"))
+spec = importlib.util.spec_from_file_location(
+    "media_shortcuts",
+    ROOT / "hermes" / "main" / "plugins" / "zalo" / "media_shortcuts.py",
+)
+mod = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(mod)
+
+
+def test_image_gen_timeout_default() -> None:
+    os.environ.pop("OMNI_IMAGE_GEN_TIMEOUT_S", None)
+    assert mod._omni_image_gen_timeout_s() == 300
+
+
+def test_image_gen_timeout_clamped() -> None:
+    os.environ["OMNI_IMAGE_GEN_TIMEOUT_S"] = "9999"
+    try:
+        assert mod._omni_image_gen_timeout_s() == 300
+    finally:
+        os.environ.pop("OMNI_IMAGE_GEN_TIMEOUT_S", None)
+
+
+def test_composition_plan_budget_is_a_fixed_protocol_bound() -> None:
+    assert mod._COMPOSITION_PLAN_MAX_TOKENS == 8192
+    assert "OMNI_COMPOSITION_PLAN_MAX_TOKENS" not in Path(mod.__file__).read_text(
+        encoding="utf-8"
+    )
+
+
+def test_planning_retries_truncated_reasoning_output() -> None:
+    import omni_env
+
+    calls: list[int] = []
+    original_once = mod._omni_json_plan_once
+    original_base = omni_env.resolve_media_router_base_url
+    original_key = omni_env.resolve_media_router_api_key
+
+    def fake_once(base, key, model, system, user, *, max_tokens):
+        calls.append(max_tokens)
+        if len(calls) == 1:
+            # Reasoning consumed the budget: content truncated at the limit.
+            return None, '{"facts":', "length"
+        return {"facts": [{"label": "L", "value": "V"}]}, '{"facts":[...]}', "stop"
+
+    omni_env.resolve_media_router_base_url = lambda: "http://omni/v1"
+    omni_env.resolve_media_router_api_key = lambda: "k"
+    mod._omni_json_plan_once = fake_once
+    try:
+        out = mod._omni_json_plan("system", "user", max_tokens=4096)
+    finally:
+        mod._omni_json_plan_once = original_once
+        omni_env.resolve_media_router_base_url = original_base
+        omni_env.resolve_media_router_api_key = original_key
+    assert out.get("facts") == [{"label": "L", "value": "V"}]
+    assert calls == [4096, 8192], calls
+
+
+def test_planning_does_not_retry_non_length_failures() -> None:
+    import omni_env
+
+    calls: list[int] = []
+    original_once = mod._omni_json_plan_once
+    original_base = omni_env.resolve_media_router_base_url
+    original_key = omni_env.resolve_media_router_api_key
+
+    def fake_once(base, key, model, system, user, *, max_tokens):
+        calls.append(max_tokens)
+        return None, "", "content_filter"
+
+    omni_env.resolve_media_router_base_url = lambda: "http://omni/v1"
+    omni_env.resolve_media_router_api_key = lambda: "k"
+    mod._omni_json_plan_once = fake_once
+    try:
+        out = mod._omni_json_plan("system", "user", max_tokens=4096)
+    finally:
+        mod._omni_json_plan_once = original_once
+        omni_env.resolve_media_router_base_url = original_base
+        omni_env.resolve_media_router_api_key = original_key
+    assert out == {}
+    assert calls == [4096], calls
+
+
+def test_composition_synthesis_uses_full_multi_region_budget() -> None:
+    captured = {"max_tokens": 0}
+    original = mod._omni_json_plan
+
+    def fake_plan(_system, _user, *, max_tokens):
+        captured["max_tokens"] = max_tokens
+        return {
+            "title": "Summary",
+            "facts": [{"label": "Value", "value": "One", "emphasis": "normal"}],
+            "design": {},
+            "include_timestamp": False,
+            "background_scene": "Balanced abstract background",
+        }
+
+    mod._omni_json_plan = fake_plan
+    try:
+        result = mod._synthesize_composition_plan(
+            {"answer": "Grounded value: One"},
+            query="Create one composed image",
+            instruction="RENDER: composed-image",
+        )
+    finally:
+        mod._omni_json_plan = original
+
+    assert result.get("facts")
+    assert captured["max_tokens"] == 8192
+
+
+def test_image_gen_size_default() -> None:
+    os.environ.pop("OMNI_IMAGE_GEN_SIZE", None)
+    assert mod._omni_image_gen_size() == "1280x720"
+
+
+def test_image_gen_model_combo() -> None:
+    os.environ["IMAGE_GEN_COMBO"] = "image-gen"
+    try:
+        assert mod._omni_image_gen_model() == "image-gen"
+    finally:
+        os.environ.pop("IMAGE_GEN_COMBO", None)
+
+
+def test_image_gen_model_uses_member_id_when_combo_is_member() -> None:
+    os.environ["IMAGE_GEN_COMBO"] = "img-gen/qwen-image-3.0"
+    os.environ.pop("IMAGE_GEN_HEAD_MEMBER", None)
+    try:
+        assert mod._omni_image_gen_model() == "img-gen/qwen-image-3.0"
+    finally:
+        os.environ.pop("IMAGE_GEN_COMBO", None)
+
+
+def test_image_quality_mins_hd() -> None:
+    min_w, min_h, min_bytes = mod._omni_image_quality_mins("1280x720")
+    assert min_w == 640 and min_h == 360 and min_bytes == 80_000
+
+
+def test_image_quality_mins_full_hd() -> None:
+    min_w, min_h, _ = mod._omni_image_quality_mins("1920x1080")
+    assert min_w == 960 and min_h == 540
+
+
+def test_media_out_candidates_shared_first() -> None:
+    os.environ["HERMES_SHARED_DATA"] = "/opt/data"
+    os.environ.pop("HERMES_HOME", None)
+    os.environ.pop("MEDIA_OUT_DIR", None)
+    try:
+        roots = [p.as_posix() for p in mod._media_out_candidates()]
+        assert roots[0] == "/opt/data/media/out"
+        assert "/data/assistant/media/out" in roots
+    finally:
+        os.environ.pop("HERMES_SHARED_DATA", None)
+
+
+def test_composed_image_prompt_uses_external_policy() -> None:
+    prompt = mod._composition_image_prompt(
+        "Editorial paper-cut skyline at evening",
+        {
+            "title": "City",
+            "facts": [{"label": "Index", "value": "92", "emphasis": "primary"}],
+            "panels": [],
+            "design": {"placement": "bottom-left"},
+            "include_timestamp": False,
+        },
+    )
+    low = prompt.lower()
+    assert "paper-cut" in low
+    assert "index" in low
+    assert "full-bleed" in low
+    assert "no gray or blank padding" in low
+    assert "photorealistic" not in low
+
+
+def test_combo_failover_tries_combo_then_members() -> None:
+    calls: list[str] = []
+    original = mod._omni_request_image_blob_once
+
+    def fake_once(**kwargs):
+        candidate = kwargs.get("model", "")
+        calls.append(candidate)
+        if candidate == "ai-box/wan2.7-image-pro":
+            return b"\x89PNG-fake-blob"
+        return None
+
+    mod._omni_request_image_blob_once = fake_once
+    try:
+        blob = mod._omni_request_image_blob(
+            base="http://omni/v1",
+            key="k",
+            model="image-gen",
+            scene="hcm",
+            size="1280x720",
+            timeout=30,
+            combo_members=["pollinations/flux", "ai-box/wan2.7-image-pro"],
+        )
+    finally:
+        mod._omni_request_image_blob_once = original
+
+    assert blob == b"\x89PNG-fake-blob"
+    assert calls == ["pollinations/flux", "ai-box/wan2.7-image-pro"]
+
+
+def test_successful_image_stops_without_extra_model_calls() -> None:
+    calls: list[str] = []
+    original = mod._omni_request_image_blob_once
+
+    def fake_once(**kwargs):
+        candidate = kwargs.get("model", "")
+        calls.append(candidate)
+        return candidate.encode()
+
+    mod._omni_request_image_blob_once = fake_once
+    try:
+        blob = mod._omni_request_image_blob(
+            base="http://omni/v1",
+            key="k",
+            model="image-gen",
+            scene="hcm",
+            size="1280x720",
+            timeout=30,
+            combo_members=["provider/poor", "provider/good"],
+        )
+    finally:
+        mod._omni_request_image_blob_once = original
+
+    assert blob == b"provider/poor"
+    assert calls == ["provider/poor"]
+
+
+def test_successful_generation_does_not_use_vision() -> None:
+    import vision_ocr
+
+    original_chat = vision_ocr._vision_chat
+    original_once = mod._omni_request_image_blob_once
+    def unexpected_vision(*_args, **_kwargs):
+        raise AssertionError("ordinary image generation must not call vision")
+    vision_ocr._vision_chat = unexpected_vision
+    mod._omni_request_image_blob_once = lambda **_kwargs: b"image"
+    try:
+        blob = mod._omni_request_image_blob(
+            base="http://omni/v1", key="k", model="image-gen",
+            scene="a grounded information image", size="1280x720", timeout=30,
+            combo_members=["provider/first", "provider/second"],
+        )
+    finally:
+        vision_ocr._vision_chat = original_chat
+        mod._omni_request_image_blob_once = original_once
+    assert blob == b"image"
+    assert not hasattr(mod, "_composition_image_quality_ok")
+
+
+def test_combo_member_models_parses_v1_combos() -> None:
+    payload = {
+        "data": [
+            {"name": "other", "models": [{"model": "x/a"}]},
+            {"name": "image-gen", "models": [{"model": "ai-box/wan"}, {"model": "ai-box/wan"}]},
+        ]
+    }
+
+    captured = {"url": None}
+
+    class _Resp:
+        def __init__(self, data):
+            self._data = data
+
+        def read(self):
+            return json.dumps(self._data).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_open(req, timeout=0):
+        captured["url"] = req.full_url
+        return _Resp(payload)
+
+    original = mod.urllib.request.urlopen
+    mod.urllib.request.urlopen = fake_open
+    try:
+        members = mod._omni_v1_combo_member_models("http://omni/v1", "k", "image-gen")
+    finally:
+        mod.urllib.request.urlopen = original
+
+    assert captured["url"] == "http://omni/v1/combos"
+    assert members == ["ai-box/wan"]
+
+
+def test_image_request_can_wait_full_five_minute_budget() -> None:
+    captured = {"timeout": 0}
+
+    class _Resp:
+        def read(self):
+            body = {"data": [{"b64_json": base64.b64encode(b"image").decode()}]}
+            return json.dumps(body).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_open(_req, timeout=0):
+        captured["timeout"] = timeout
+        return _Resp()
+
+    original_open = mod.urllib.request.urlopen
+    original_quality = mod._omni_image_quality_ok
+    mod.urllib.request.urlopen = fake_open
+    mod._omni_image_quality_ok = lambda _blob, *, size: True
+    try:
+        result = mod._omni_request_image_blob_once(
+            base="http://omni/v1",
+            key="k",
+            model="provider/model",
+            scene="test scene",
+            size="1280x720",
+            timeout=300,
+        )
+    finally:
+        mod.urllib.request.urlopen = original_open
+        mod._omni_image_quality_ok = original_quality
+    assert result == b"image"
+    assert 298 <= captured["timeout"] <= 300, captured
+
+
+def test_composition_dedupes_facts_duplicated_in_panels() -> None:
+    original = mod._omni_json_plan
+
+    def fake_plan(_system, _user, *, max_tokens):
+        rows = [
+            {"label": "Nhiệt độ", "value": "22.7 °C", "emphasis": "primary"},
+            {"label": "Độ ẩm", "value": "83%", "emphasis": "normal"},
+        ]
+        return {
+            "title": "Da Nang Now",
+            "facts": [dict(r) for r in rows],
+            "panels": [{"title": "Frame", "facts": [dict(r) for r in rows],
+                        "design": {"placement": "left-column"}}],
+            "design": {"placement": "auto"},
+            "include_timestamp": False,
+            "background_scene": "Da Nang beach",
+        }
+
+    mod._omni_json_plan = fake_plan
+    try:
+        plan = mod._synthesize_composition_plan({"answer": "grounded"}, query="q", instruction="i")
+    finally:
+        mod._omni_json_plan = original
+    assert plan.get("panels"), plan
+    assert plan.get("facts") == [], plan
+
+
+def test_composition_keeps_distinct_top_level_facts() -> None:
+    original = mod._omni_json_plan
+
+    def fake_plan(_system, _user, *, max_tokens):
+        return {
+            "title": "Da Nang Now",
+            "facts": [
+                {"label": "Nhiệt độ", "value": "22.7 °C", "emphasis": "primary"},
+                {"label": "Cập nhật", "value": "11:11", "emphasis": "normal"},
+            ],
+            "panels": [{"title": "Fuel", "facts": [{"label": "Nhiệt độ", "value": "22.7 °C"}],
+                        "design": {"placement": "left-column"}}],
+            "design": {"placement": "auto"},
+            "include_timestamp": False,
+            "background_scene": "Da Nang beach",
+        }
+
+    mod._omni_json_plan = fake_plan
+    try:
+        plan = mod._synthesize_composition_plan({"answer": "grounded"}, query="q", instruction="i")
+    finally:
+        mod._omni_json_plan = original
+    labels = [(row["label"], row["value"]) for row in plan.get("facts") or []]
+    assert labels == [("Cập nhật", "11:11")], labels
+
+
+def main() -> None:
+    test_image_gen_timeout_default()
+    test_image_gen_timeout_clamped()
+    test_composition_plan_budget_is_a_fixed_protocol_bound()
+    test_composition_dedupes_facts_duplicated_in_panels()
+    test_composition_keeps_distinct_top_level_facts()
+    test_planning_retries_truncated_reasoning_output()
+    test_planning_does_not_retry_non_length_failures()
+    test_composition_synthesis_uses_full_multi_region_budget()
+    test_image_gen_size_default()
+    test_image_gen_model_combo()
+    test_image_gen_model_uses_member_id_when_combo_is_member()
+    test_image_quality_mins_hd()
+    test_image_quality_mins_full_hd()
+    test_media_out_candidates_shared_first()
+    test_composed_image_prompt_uses_external_policy()
+    test_combo_failover_tries_combo_then_members()
+    test_successful_image_stops_without_extra_model_calls()
+    test_successful_generation_does_not_use_vision()
+    test_combo_member_models_parses_v1_combos()
+    test_image_request_can_wait_full_five_minute_budget()
+    print("OK media_shortcuts_omni_unit")
+
+
+if __name__ == "__main__":
+    main()

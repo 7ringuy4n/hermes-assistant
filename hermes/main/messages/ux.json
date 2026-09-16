@@ -1,0 +1,123 @@
+{
+  "schema": "assistant-messages-v1",
+  "artifacts": {
+    "delivery_failed": {
+      "default": "en",
+      "en": "The requested file could not be delivered. Please try again.",
+      "vi": "Không thể gửi tệp được yêu cầu. Vui lòng thử lại."
+    }
+  },
+  "records": {
+    "scope_denied": {
+      "default": "en",
+      "en": "Cannot access that conversation's records. Cross-conversation access requires the operator admin and a known conversation.",
+      "vi": "Không thể truy cập ghi chú hoặc lịch của cuộc trò chuyện đó. Chỉ quản trị viên hệ thống được truy cập cuộc trò chuyện khác đã đăng ký."
+    }
+  },
+  "cite": {
+    "empty": "No information found in knowledge.",
+    "empty_topic": "No information found for «{topic}».",
+    "ingest_down": "Knowledge service is unavailable. Try again later.",
+    "list_header": "Matches «{topic}» — {shown}/{total}:",
+    "rest": "{n} more."
+  },
+  "secret_probe": {
+    "refuse": {
+      "default": "en",
+      "en": "Cannot provide secrets, credentials, or protected server paths.",
+      "vi": "Không thể cung cấp bí mật, thông tin đăng nhập hoặc đường dẫn máy chủ được bảo vệ."
+    }
+  },
+  "security": {
+    "av_blocked": "This file was blocked (malware or test virus). It will not be learned.",
+    "av_unavailable": "Antivirus is not ready. File was not accepted — try again later."
+  },
+  "queue": {
+    "rate_limited": "Bạn gửi hơi nhanh — tin này đã vào hàng chờ, mình sẽ trả lời lần lượt.",
+    "queued": "Mình đang trả lời tin trước. Vui lòng chờ.",
+    "already_answering": "Bot đang trả lời tin này. Đợi xong rồi gửi tiếp nhé (tối đa khoảng 15 phút).",
+    "full": "Hàng chờ đầy. Gửi lại sau giúp mình.",
+    "turn_timeout": "Xin lỗi, tin trước xử lý quá lâu (hơn 15 phút) nên mình dừng lại. Bạn gửi tin tiếp theo nhé."
+  },
+  "schedule": {
+    "saved": {
+      "default": "en",
+      "en": "Schedule saved!",
+      "vi": "Đã lưu lịch!"
+    },
+    "failed": {
+      "default": "en",
+      "en": "Could not save this schedule. Please send it again.",
+      "vi": "Không lưu được lịch. Bạn gửi lại giúp mình."
+    },
+    "job_failed": {
+      "default": "en",
+      "en": "Scheduled job failed. Please try again later.",
+      "vi": "Lịch chạy không thành công. Vui lòng thử lại sau."
+    }
+  },
+  "notes": {
+    "saved": {
+      "default": "en",
+      "en": "Note saved.",
+      "vi": "Đã lưu ghi chú."
+    },
+    "deleted": {
+      "default": "en",
+      "en": "Deleted {count} note(s).",
+      "vi": "Đã xoá {count} ghi chú."
+    },
+    "updated": {
+      "default": "en",
+      "en": "Updated {count} note(s).",
+      "vi": "Đã cập nhật {count} ghi chú."
+    },
+    "confirm": {
+      "default": "en",
+      "en": "This affects {count} note(s). Reply exactly CONFIRM to proceed, or send a narrower request.",
+      "vi": "Thao tác này ảnh hưởng {count} ghi chú. Trả lời đúng XÁC NHẬN để tiếp tục, hoặc gửi yêu cầu hẹp hơn."
+    },
+    "empty": {
+      "default": "en",
+      "en": "No matching saved notes were found.",
+      "vi": "Không tìm thấy ghi chú phù hợp."
+    },
+    "count": {
+      "default": "en",
+      "en": "{count} notes.",
+      "vi": "Bạn có {count} ghi chú."
+    },
+    "ambiguous": {
+      "default": "en",
+      "en": "More than one note matches. Reply with the note id to choose one.",
+      "vi": "Có nhiều ghi chú phù hợp. Hãy trả lời bằng mã ghi chú để chọn."
+    },
+    "failed": {
+      "default": "en",
+      "en": "The note operation could not be completed. Please try again.",
+      "vi": "Không thể hoàn tất thao tác ghi chú. Vui lòng thử lại."
+    }
+  },
+  "session": {
+    "interrupted": {
+      "default": "en",
+      "en": "This session was interrupted. Please try again later.",
+      "vi": "Phiên làm việc bị gián đoạn, vui lòng thử lại sau."
+    }
+  },
+  "classify": {
+    "failed": {
+      "default": "en",
+      "en": "Could not classify this request. Please send it again.",
+      "vi": "Chưa nhận diện được yêu cầu. Bạn gửi lại giúp mình."
+    }
+  },
+  "outbound_protocol_drop": [
+    "Context compaction complete",
+    "Request payload too large (413)",
+    "Session auto-reset",
+    "compression attempt",
+    "vars() argument must have __dict__"
+  ],
+  "outbound_note": "Agent status frames (Working / iteration N/M / model provider failed) are dropped by structural rules in gateway_noise.py plus LLM /v1/outbound. Do not grow this list for every new phrase — improve quiet-delivery skill and skills/outbound/outbound.json instead."
+}

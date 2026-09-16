@@ -1,0 +1,345 @@
+# -*- coding: utf-8 -*-
+"""Inject visual weather PDF turn for Zalo user Tn (VPS lab).
+
+The target user id is required through ``ZALO_TEST_USER_ID``.
+Message asks for attractive PDF + city imagery — must NOT dump SERP chrome.
+Env: ASSISTANT_SSH_* ; ZALO_TEST_USER_ID ; ZALO_TEST_WAIT_S (default 240);
+ZALO_TEST_MESSAGE (optional exact fixture)
+Report: test/reports/run-zalo-tn-visual-weather-pdf/
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from deploy_stack import connect, sudo_bash  # noqa: E402
+from sanitize import sanitize as _sanitize  # noqa: E402
+from visual_weather_pdf_gate import (  # noqa: E402
+    blocking_defects_clear as _blocking_defects_clear,
+    delivered_image_count as _delivered_image_count,
+    extracted_pdf_text as _extracted_pdf_text,
+    new_pdf_seen as _new_pdf_seen,
+    unrequested_current_scope_terms as _unrequested_current_scope_terms,
+    visual_quality_score as _visual_quality_score,
+    weather_code_defects as _weather_code_defects,
+    model_attribution_defects as _model_attribution_defects,
+)
+
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+ROOT = Path(os.environ.get("ASSISTANT_REPO_ROOT", Path(__file__).resolve().parents[2]))
+OUT = ROOT / "test" / "reports" / "run-zalo-tn-visual-weather-pdf"
+TN_ID = (os.environ.get("ZALO_TEST_USER_ID") or "").strip()
+WAIT_S = int(os.environ.get("ZALO_TEST_WAIT_S") or "240")
+MSG = (os.environ.get("ZALO_TEST_MESSAGE") or (
+    "cập nhật thời tiết hiện tại ở Đà Nẵng và vẽ vào file pdf, "
+    "giao diện phải bắt mắt và hợp gu người nhìn"
+)).strip()
+
+
+def ts() -> str:
+    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+
+
+def _clean(text: str) -> str:
+    lines = []
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if "sudo" in low and "password" in low:
+            continue
+        if low.startswith("[sudo"):
+            continue
+        lines.append(s)
+    return "\n".join(lines)
+
+
+def main() -> int:
+    if not TN_ID:
+        print("ERROR: ZALO_TEST_USER_ID is required", file=sys.stderr)
+        return 2
+    OUT.mkdir(parents=True, exist_ok=True)
+    c = connect()
+    marker = f"lab-visual-weather-pdf-{int(time.time())}"
+    report: dict = {
+        "ts": ts(),
+        "target": "runtime-authorized-user",
+        "message": MSG,
+        "marker": marker,
+    }
+    try:
+        # Do not pipe JSON through sanitize() — it redacts 127.0.0.1 and breaks curl.
+        remote = f"""
+set -euo pipefail
+START_EPOCH=$(date +%s)
+python3 - <<'PY'
+import json, urllib.request
+payload = {{
+    "type": "message",
+    "threadId": {TN_ID!r},
+    "threadType": "user",
+    "senderId": {TN_ID!r},
+    "senderName": "Tn",
+    "text": {MSG!r},
+    "messageId": {marker!r},
+}}
+req = urllib.request.Request(
+    "http://127.0.0.1:8787/inject-event",
+    data=json.dumps(payload).encode("utf-8"),
+    headers={{"Content-Type": "application/json"}},
+    method="POST",
+)
+with urllib.request.urlopen(req, timeout=30) as r:
+    print(r.read().decode("utf-8", "replace")[:400])
+print("INJECT_OK")
+PY
+NEWPDF=""
+export LAB_START="$START_EPOCH"
+NEWPDF=$(python3 - <<'PY'
+import json,os,pathlib,subprocess,sys,time
+sys.path.insert(0,'/opt/assistant/test/scripts')
+from scoped_documents_smoke_lab import acknowledged_artifact,thread_terminal
+source={marker!r}
+tid={TN_ID!r}
+api=subprocess.check_output(['docker','ps','--filter','label=com.docker.compose.service=zalo-api','--format','{{{{.Names}}}}'],text=True).splitlines()[0]
+probe='''import os,json,psycopg
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+ rows=c.execute("SELECT content,meta,message_id,thread_id,thread_type FROM zalo_message_history WHERE event='delivered' AND meta->>'source_message_id'=%s ORDER BY id",(os.environ["SOURCE_ID"],)).fetchall()
+print(json.dumps([dict(zip(("content","meta","message_id","thread_id","thread_type"),row)) for row in rows]))
+'''
+deadline=time.monotonic()+{WAIT_S}; settled=None
+while time.monotonic()<deadline:
+ rows=json.loads(subprocess.check_output(['docker','exec','-e','SOURCE_ID='+source,api,'python3','-c',probe],text=True))
+ rows=[r for r in rows if (r.get('meta') or dict()).get('delivery_kind')!='gate']
+ if len(rows)>1: raise SystemExit('FAIL_MULTIPLE_FINAL_DELIVERIES')
+ if rows and thread_terminal(tid):
+  settled=settled or time.monotonic()
+  if time.monotonic()-settled>=6: break
+ else: settled=None
+ time.sleep(3)
+else: raise SystemExit('FAIL_TERMINAL_PDF_DELIVERY')
+row=rows[0]; meta=row.get('meta') or dict()
+filename=meta.get('file_name') or ''
+if row['thread_id']!=tid or row['thread_type']!='user': raise SystemExit('FAIL_WRONG_SOURCE_CHANNEL')
+if pathlib.Path(filename).name!=filename or not filename.lower().endswith('.pdf'): raise SystemExit('FAIL_NON_PDF_FINAL')
+root=pathlib.Path('/data/assistant/media/out').resolve()
+candidates=[p for p in root.rglob(filename) if p.is_file() and p.stat().st_mtime>=float(os.environ['LAB_START']) and p.resolve().is_relative_to(root)]
+path=acknowledged_artifact(candidates,(tid,'user',source),row['message_id'])
+print(str(path))
+PY
+)
+echo "NEW_PDF $NEWPDF"
+echo "DELIVERED_IMAGE_COUNT 0"
+HOST_PDF="$NEWPDF"
+CONT_PDF="${{HOST_PDF/\\/data\\/assistant\\/media/\\/data\\/media}}"
+DISPATCHER_ID=$(docker ps \
+  --filter label=com.docker.compose.service=dispatcher \
+  --format '{{{{.ID}}}}' | head -1)
+if [[ -z "$DISPATCHER_ID" ]]; then
+  echo "NO_DISPATCHER_CONTAINER"
+  exit 1
+fi
+docker exec -i -e P="$CONT_PDF" -e P2="$HOST_PDF" "$DISPATCHER_ID" python - <<'PY'
+import base64
+import json
+import os
+import urllib.request
+from pathlib import Path
+import fitz
+
+p = Path(os.environ.get("P") or "")
+if not p.is_file():
+    p = Path(os.environ.get("P2") or "")
+print("size", p.stat().st_size if p.is_file() else 0)
+if not p.is_file():
+    raise SystemExit("FAIL_PDF_NOT_SHARED")
+doc = fitz.open(str(p))
+if len(doc) < 1:
+    raise SystemExit("FAIL_PDF_NO_PAGES")
+text = "\\n".join((page.get_text("text") or "").strip() for page in doc)
+images = [page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False).tobytes("png") for page in doc]
+print("PDF_PAGE_COUNT", len(doc))
+print("PDF_TEXT_CHARS", len(text))
+print("PDF_TEXT_BEGIN")
+print(text)
+print("PDF_TEXT_END")
+if len(text) < 80 or any(len(image) < 10000 for image in images):
+    raise SystemExit("FAIL_PDF_UNREADABLE")
+
+body = json.dumps(dict(
+    model=os.environ.get("OMNIROUTER_VISION_COMBO") or "vision-ocr",
+    stream=False,
+    max_tokens=260,
+    messages=[dict(role="user", content=[
+        dict(type="text", text=(
+            "Evaluate ALL rendered PDF pages as one professional information document. "
+            "Use the worst page to determine the overall score; list a blocker on any page. "
+            "Check visual hierarchy, readability, spacing, contrast, factual labels, "
+            "correct Vietnamese spelling and complete readable glyphs, and useful imagery. "
+            "and whether any interface chrome or unrelated title leaked into the page. "
+            "First output exactly QUALITY_SCORE: <integer>/10. On the next line output "
+            "exactly BLOCKING_DEFECTS: none, or a concise comma-separated list. "
+            "Blocking defects include overlap, clipping, unreadable text, broken hierarchy, "
+            "or materially wasted page space. Then give concise reasons."
+        )),
+    ] + [dict(type="image_url", image_url=dict(url=(
+            "data:image/png;base64," + base64.b64encode(image).decode("ascii")
+        ))) for image in images])],
+)).encode("utf-8")
+base = (os.environ.get("OMNIROUTER_BASE_URL") or "http://omni-router:20129/v1").rstrip("/")
+key = (os.environ.get("OMNIROUTER_API_KEY") or "").strip()
+request = urllib.request.Request(
+    base + "/chat/completions",
+    data=body,
+    method="POST",
+    headers=dict([
+        ("Authorization", "Bearer " + key),
+        ("Content-Type", "application/json"),
+    ]),
+)
+with urllib.request.urlopen(request, timeout=180) as response:
+    result = json.loads(response.read().decode("utf-8") or "{{}}")
+evaluation = str((((result.get("choices") or [dict()])[0].get("message") or dict()).get("content") or "")).strip()
+if len(evaluation) < 40:
+    raise SystemExit("FAIL_PDF_VISUAL_EVALUATION")
+print("PDF_VISUAL_EVALUATION_BEGIN")
+print(evaluation[:1600])
+print("PDF_VISUAL_EVALUATION_END")
+print("PDF_STRUCTURE_OK")
+PY
+python3 - <<'PY'
+import sys
+sys.path.insert(0,'/opt/assistant/test/scripts')
+from scoped_documents_smoke_lab import delivered
+rows=[r for r in delivered({marker!r}) if (r.get('meta') or dict()).get('delivery_kind')!='gate']
+if len(rows)!=1 or not str((rows[0].get('meta') or dict()).get('file_name') or '').lower().endswith('.pdf'):
+ raise SystemExit('FAIL_LATE_EXTRA_OR_NON_PDF_DELIVERY')
+print('FINAL_SOURCE_DELIVERY_COUNT',len(rows))
+PY
+ZALO_API_ID=$(docker ps \
+  --filter label=com.docker.compose.service=zalo-api \
+  --format '{{{{.ID}}}}' | head -1)
+docker exec -e SOURCE_ID={marker!r} "$ZALO_API_ID" python3 -c '
+import os, psycopg
+with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+    row = c.execute(
+        "select count(*) from zalo_message_history "
+        "where event='"'"'delivered'"'"' "
+        "and meta->>'"'"'attachment_kind'"'"'='"'"'image'"'"' "
+        "and meta->>'"'"'source_message_id'"'"'=%s",
+        (os.environ["SOURCE_ID"],),
+    ).fetchone()
+print("DELIVERED_IMAGE_COUNT", int(row[0] if row else 0))
+'
+"""
+        print(f"SOURCE_ID {marker}", flush=True)
+        print(f"INJECTED wait up to {WAIT_S}s", flush=True)
+        out = _clean(sudo_bash(c, remote, timeout=WAIT_S + 240))
+        report["remote"] = _sanitize(out)[-8000:]
+        print(out[-2000:], flush=True)
+
+        logs = _clean(
+            sudo_bash(
+                c,
+                "for c in $(docker ps --format '{{.Names}}' | grep '^assistant-hermes-'); do "
+                "docker logs --since 8m $c 2>&1 | tail -n 80; done",
+                timeout=60,
+            )
+        )
+        report["logs_tail"] = _sanitize(logs)[-8000:]
+
+        blob = (out + "\n" + logs).lower()
+        # Only actual acknowledged PDF text can establish a document leak;
+        # legitimate source names or an unrelated prior greeting are not defects.
+        document_blob = _extracted_pdf_text(out).lower()
+        fail_bits = (
+            "có thể bạn quan",
+            "tạo file pdf dự báo",
+            "tạo file pdf bản tin",
+            "|------",
+        )
+        bad = [b for b in fail_bits if b in document_blob]
+        greeting_leak = "gõ /help" in document_blob
+        report["fail_bits"] = bad
+        report["greeting_leak"] = greeting_leak
+        new_pdf = _new_pdf_seen(out)
+        report["new_pdf"] = new_pdf
+        report["pdf_structure_ok"] = "PDF_STRUCTURE_OK" in out
+        report["visual_evaluation"] = (
+            out.split("PDF_VISUAL_EVALUATION_BEGIN", 1)[1]
+            .split("PDF_VISUAL_EVALUATION_END", 1)[0]
+            .strip()
+            if "PDF_VISUAL_EVALUATION_BEGIN" in out
+            and "PDF_VISUAL_EVALUATION_END" in out
+            else ""
+        )
+        evaluation = report["visual_evaluation"]
+        visual_score = _visual_quality_score(evaluation)
+        report["visual_quality_score"] = visual_score
+        report["visual_blocking_defects_clear"] = _blocking_defects_clear(evaluation)
+        pdf_text = _extracted_pdf_text(out)
+        scope_bad = _unrequested_current_scope_terms(pdf_text)
+        factual_bad = _weather_code_defects(pdf_text) + _model_attribution_defects(pdf_text)
+        report["known_weather_code_defects"] = factual_bad
+        report["unrequested_scope"] = scope_bad
+        unexpected_image = "UNEXPECTED_NEW_IMAGE" in out
+        report["unexpected_image"] = unexpected_image
+        delivered_count = _delivered_image_count(out)
+        report["delivery_history_query_ok"] = delivered_count is not None
+        delivered_image = delivered_count is None or delivered_count > 0
+        report["unexpected_image_delivery"] = delivered_image
+
+        out_path = OUT / f"report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+        out_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"REPORT {out_path}", flush=True)
+        if "INJECT_OK" not in out:
+            print("FAIL inject", flush=True)
+            return 1
+        if bad:
+            print("FAIL serp/create chrome in pdf/logs:", bad, flush=True)
+            return 1
+        if greeting_leak:
+            print("FAIL hello/help leak without file delivery", flush=True)
+            return 1
+        if not new_pdf:
+            print("FAIL no new pdf produced (quota/rate-limit → skip)", flush=True)
+            if "maxwaitms" in blob or "rate-limit" in blob or "quota" in blob:
+                print("SKIP rate-limit/quota", flush=True)
+                return 1
+            return 1
+        if delivered_image:
+            print("FAIL requested PDF also delivered a standalone image", flush=True)
+            return 1
+        if scope_bad:
+            print("FAIL current-only PDF added unrequested scope:", scope_bad, flush=True)
+            return 1
+        if factual_bad:
+            print("FAIL source-grounded weather description:", factual_bad, flush=True)
+            return 1
+        if "PDF_STRUCTURE_OK" not in out:
+            if "rate-limit" in blob or "quota" in blob or "429" in blob:
+                print("SKIP visual evaluator rate-limit/quota", flush=True)
+                return 1
+            print("FAIL PDF structure or visual evaluation", flush=True)
+            return 1
+        if visual_score is None or visual_score < 8 or not _blocking_defects_clear(evaluation):
+            print("FAIL PDF visual quality gate", flush=True)
+            return 1
+        print("PASS visual weather pdf", flush=True)
+        return 0
+    finally:
+        c.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
