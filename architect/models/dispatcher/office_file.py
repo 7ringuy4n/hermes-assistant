@@ -1,0 +1,1307 @@
+"""Office file create + Zalo send. Enable: OFFICE_FILE_GEN=active (compose / Media worker).
+
+PDF path: LLM authors HTML (preferred) or raw PDF bytes; dispatcher converts HTML→PDF.
+No ReportLab layout templates.
+"""
+from __future__ import annotations
+
+import base64
+import logging
+import os
+import subprocess
+import uuid
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+log = logging.getLogger("office_file")
+
+_OFFICE_OK = {".txt", ".csv", ".md", ".xlsx", ".docx", ".pdf", ".pptx"}
+_KIND_EXT = {
+    "pdf": ".pdf",
+    "txt": ".txt",
+    "text": ".txt",
+    "docx": ".docx",
+    "xlsx": ".xlsx",
+    "csv": ".csv",
+    "md": ".md",
+    "markdown": ".md",
+    "pptx": ".pptx",
+    "ppt": ".pptx",
+}
+
+_MEDIA_ROOTS = (
+    Path(os.environ.get("MEDIA_CACHE_DIR", "/data/media")) / "out",
+    Path(os.environ.get("MEDIA_CACHE_DIR", "/data/media")) / "inbound",
+    Path("/opt/data/media/out"),
+    Path("/data/assistant/media/out"),
+    Path("/opt/data/media/inbound"),
+    Path("/data/assistant/media/inbound"),
+)
+
+try:
+    from pydantic import BaseModel as _PydanticBase
+except ImportError:  # unit hosts without pydantic
+    class _PydanticBase:  # type: ignore[no-redef]
+        def __init__(self, **kwargs: Any) -> None:
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+
+class OfficeFileReq(_PydanticBase):
+    prompt: str = ""
+    thread_id: str = ""
+    thread_type: str = "user"
+    caption: str = ""
+    filename: Optional[str] = None
+    output_type: Optional[str] = None
+    send_zalo: bool = True
+    draft: bool = False
+
+
+def _enabled() -> bool:
+    v = (
+        os.environ.get("OFFICE_FILE_GEN") or os.environ.get("ZALO_OFFICE_FILE") or "inactive"
+    ).strip().lower()
+    return v in {"1", "true", "yes", "on", "active"}
+
+
+def is_compound_office_request(text: str) -> bool:
+    """Compounds are classify's job. Host never scans kinds in user prose."""
+    del text
+    return False
+
+
+def parse_office(prompt: str, output_type: str = "") -> tuple[str, str]:
+    """Return (ext, body) from classify inner work + output_type. No prose NLU."""
+    body = (prompt or "").strip() or " "
+    kind = (output_type or "").strip().lower().lstrip(".")
+    ext = _KIND_EXT.get(kind, ".txt")
+    return ext, body
+
+
+def parse_office_jobs(prompt: str, output_type: str = "") -> list[tuple[str, str]]:
+    """One office prompt → one job. Classify already split compounds."""
+    raw = (prompt or "").strip()
+    if not raw:
+        return []
+    return [parse_office(raw, output_type)]
+
+
+def _skip_structural_junk(line: str) -> bool:
+    """Drop empty lines, URLs, JSON blobs, unfilled templates, markdown table chrome."""
+    s = (line or "").strip()
+    if not s or len(s) < 2:
+        return True
+    if s.startswith(("{", "[", "'{", '"{')):
+        return True
+    if "{'" in s or '{"' in s:
+        return True
+    low = s.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        return True
+    if "value after" in low or "<value" in low:
+        return True
+    if "safe-for-work" in low or "safe for work" in low:
+        return True
+    if s.startswith("|"):
+        core = (
+            s.replace("|", "")
+            .replace("-", "")
+            .replace(":", "")
+            .replace(" ", "")
+            .replace(".", "")
+        )
+        if not core:
+            return True
+    return False
+
+
+def _clean_inline_markdown(value: str) -> str:
+    """Remove lightweight authoring markers before writing Office XML."""
+    text = value or ""
+    for marker in ("**", "__", "`"):
+        text = text.replace(marker, "")
+    return text.strip()
+
+
+def _markdown_tables(body: str) -> list[list[list[str]]]:
+    """Collect conventional pipe tables without interpreting prose or locale."""
+    tables: list[list[list[str]]] = []
+    current: list[list[str]] = []
+
+    def flush() -> None:
+        nonlocal current
+        if len(current) >= 2:
+            tables.append(current)
+        current = []
+
+    for raw in (body or "").splitlines():
+        line = raw.strip()
+        if not (line.startswith("|") and line.endswith("|") and line.count("|") >= 2):
+            flush()
+            continue
+        cells = [_clean_inline_markdown(cell) for cell in line[1:-1].split("|")]
+        compact = "".join(cells).replace("-", "").replace(":", "").replace(" ", "")
+        if not compact:
+            continue
+        current.append(cells)
+    flush()
+    return tables
+
+
+def _looks_like_pdf_bytes(data: bytes) -> bool:
+    return bool(data) and data.lstrip().startswith(b"%PDF")
+
+
+def _decode_pdf_body(body: str) -> bytes | None:
+    """Accept raw %PDF text or PDF_BASE64: / data:application/pdf;base64, payloads."""
+    raw = (body or "").strip()
+    if not raw:
+        return None
+    if raw.lstrip().startswith("%PDF"):
+        return raw.encode("latin-1", errors="ignore")
+    marker = "PDF_BASE64:"
+    if raw.upper().startswith(marker):
+        b64 = raw[len(marker) :].strip()
+        try:
+            blob = base64.b64decode(b64, validate=False)
+        except Exception:  # noqa: BLE001
+            return None
+        return blob if _looks_like_pdf_bytes(blob) else None
+    prefix = "data:application/pdf;base64,"
+    if raw.lower().startswith(prefix):
+        try:
+            blob = base64.b64decode(raw[len(prefix) :].strip(), validate=False)
+        except Exception:  # noqa: BLE001
+            return None
+        return blob if _looks_like_pdf_bytes(blob) else None
+    return None
+
+
+def _unwrap_fenced(body: str, *, lang: str) -> str | None:
+    """Pull content from ```lang ... ``` fences without regex."""
+    s = (body or "").strip()
+    if not s.startswith("```"):
+        return None
+    first_nl = s.find("\n")
+    if first_nl < 0:
+        return None
+    header = s[3:first_nl].strip().lower()
+    if header and header != lang.lower():
+        return None
+    rest = s[first_nl + 1 :]
+    end = rest.rfind("```")
+    if end < 0:
+        return None
+    return rest[:end].strip() or None
+
+
+def _extract_html(body: str) -> str | None:
+    """Return HTML document/fragment authored by the LLM, if present."""
+    s = (body or "").strip()
+    if not s:
+        return None
+    fenced = _unwrap_fenced(s, lang="html")
+    if fenced:
+        s = fenced
+    low = s.lower().lstrip()
+    if low.startswith("<!doctype") or low.startswith("<html"):
+        return s
+    if "<html" in low:
+        idx = low.find("<html")
+        return s[idx:]
+    # HTML fragment (has tags) — wrap later
+    if "<" in s and "</" in s and ("<div" in low or "<p" in low or "<h1" in low or "<table" in low or "<section" in low or "<img" in low):
+        return s
+    return None
+
+
+def _resolve_media_path(raw: str) -> Path | None:
+    p = (raw or "").strip().strip("'").strip('"')
+    if p.startswith("file://"):
+        from urllib.parse import urlsplit
+        from urllib.request import url2pathname
+        parsed = urlsplit(p)
+        if parsed.netloc not in {"", "localhost"}:
+            return None
+        p = url2pathname(parsed.path)
+    if not p:
+        return None
+    candidates: list[Path] = []
+    media = Path(os.environ.get("MEDIA_CACHE_DIR", "/data/media"))
+    # Worker/Hermes/host paths name the same shared media volume. Translate
+    # protocol roots structurally instead of assuming identical mount points.
+    for alias in ("/opt/data/media", os.environ.get("ZALO_HOST_MEDIA_DIR", "/data/assistant/media")):
+        if p.startswith(alias.rstrip("/") + "/"):
+            candidates.append(media / p[len(alias.rstrip("/")) + 1:])
+    if Path(p).is_absolute():
+        candidates.append(Path(p))
+    for base in _MEDIA_ROOTS:
+        candidates.append(base / p)
+        if p.startswith("media/"):
+            candidates.append(base.parent / p)
+    for cand in candidates:
+        try:
+            resolved = cand.resolve()
+            if resolved.is_file() and any(resolved.is_relative_to(root.resolve()) for root in _MEDIA_ROOTS):
+                return resolved
+        except OSError:
+            continue
+    return None
+
+
+def _html_document(fragment_or_doc: str) -> str:
+    """Ensure a full HTML document with Unicode-friendly print-safe CSS."""
+    src = (fragment_or_doc or "").strip()
+    low = src.lower().lstrip()
+    if low.startswith("<!doctype") or low.startswith("<html"):
+        return src
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="vi"><head><meta charset="utf-8"/>'
+        "<title>Document</title>"
+        "<style>"
+        "@page{size:A4;margin:14mm}"
+        "html,body{margin:0;padding:0;font-family:'Noto Sans',DejaVu Sans,Arial,sans-serif;"
+        "color:#142033;background:#e8eef5;font-size:11pt;}"
+        "main{padding:0 2pt;}"
+        ".accent{height:5pt;background:linear-gradient(90deg,#1a3a66,#2a6ebd 55%,#5eb0e0);"
+        "margin:0 0 12pt;border-radius:2pt;}"
+        ".band{background:#1a3a66;color:#fff;padding:16pt 18pt;margin:0 0 14pt;border-radius:10pt;}"
+        ".band h1,h1{font-size:22pt;margin:0 0 6pt;color:#fff;page-break-after:avoid;letter-spacing:-.01em;}"
+        "h1{color:#1a3a66;}"
+        ".band h2{font-size:11pt;margin:0;color:#c5d6ea;font-weight:500;}"
+        "h2{font-size:12pt;margin:0 0 10pt;color:#3a4a5a;font-weight:600;page-break-after:avoid;}"
+        ".hero{width:100%;max-height:280px;object-fit:cover;border-radius:10pt;margin:0 0 14pt;display:block;}"
+        ".cards{display:table;width:100%;border-collapse:separate;border-spacing:8pt;margin:0 0 14pt;"
+        "page-break-inside:avoid;}"
+        ".card{display:table-cell;width:50%;background:#fff;border:1pt solid #c8d6e8;"
+        "border-radius:8pt;padding:12pt 14pt;vertical-align:top;}"
+        ".card .k{font-size:8.5pt;color:#2a6ebd;text-transform:uppercase;letter-spacing:.05em;}"
+        ".card .v{font-size:16pt;margin-top:5pt;font-weight:700;color:#0f1a28;}"
+        "ul{padding-left:18pt;} li{margin:4pt 0;} p{line-height:1.55;orphans:3;widows:3;}"
+        ".foot{margin-top:18pt;padding-top:8pt;border-top:1pt solid #c8d6e8;font-size:8.5pt;color:#6a7a8a;}"
+        "</style></head><body><main><div class=\"accent\"></div>"
+        f"{src}"
+        "</main></body></html>"
+    )
+
+
+def _rewrite_img_src_to_file_urls(html: str) -> str:
+    """Turn hermes media paths in src= into file:// URLs WeasyPrint can open."""
+    out: list[str] = []
+    i = 0
+    src_token = 'src="'
+    src_token2 = "src='"
+    while i < len(html):
+        lower = html.lower()
+        a = lower.find(src_token, i)
+        b = lower.find(src_token2, i)
+        if a < 0 and b < 0:
+            out.append(html[i:])
+            break
+        if a < 0 or (b >= 0 and b < a):
+            quote = "'"
+            start = b
+            token = src_token2
+        else:
+            quote = '"'
+            start = a
+            token = src_token
+        out.append(html[i:start + len(token)])
+        end = html.find(quote, start + len(token))
+        if end < 0:
+            out.append(html[start + len(token) :])
+            break
+        raw_src = html[start + len(token) : end]
+        path = _resolve_media_path(raw_src)
+        if path is not None:
+            out.append(path.resolve().as_uri())
+        else:
+            out.append(raw_src)
+        out.append(quote)
+        i = end + 1
+    return "".join(out)
+
+
+def write_pdf_from_html(dest: Path, html: str) -> Path:
+    """Convert LLM HTML to PDF (WeasyPrint when available; else PyMuPDF Story)."""
+    import contextlib
+    import io
+
+    doc = _rewrite_img_src_to_file_urls(_html_document(html))
+    base = str(_MEDIA_ROOTS[0]) if _MEDIA_ROOTS[0].is_dir() else str(dest.parent)
+    err = io.StringIO()
+    failed_resources: list[str] = []
+
+    def fetch_resource(url: str) -> dict[str, Any]:
+        """Render only embedded resources and validated local media assets."""
+        from urllib.parse import unquote, urlsplit
+        from weasyprint import default_url_fetcher
+
+        try:
+            parsed = urlsplit(url)
+            if parsed.scheme == "data":
+                return default_url_fetcher(url)
+            if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+                raise ValueError("external_document_resource_not_allowed")
+            path = _resolve_media_path(url)
+            if path is None:
+                raise ValueError("document_resource_missing_or_outside_media")
+            if not any(path.is_relative_to(root.resolve()) for root in _MEDIA_ROOTS):
+                raise ValueError("document_resource_outside_media")
+            if not path.is_file():
+                raise ValueError("document_resource_missing")
+            if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
+                from PIL import Image
+                with Image.open(path) as image:
+                    image.verify()
+            return default_url_fetcher(path.as_uri())
+        except Exception:
+            # WeasyPrint logs failed fetches and otherwise succeeds with blank
+            # image boxes. Preserve the failure independently of its warnings.
+            failed_resources.append("document_resource_unavailable")
+            raise
+
+    try:
+        with contextlib.redirect_stderr(err):
+            from weasyprint import HTML
+
+            HTML(string=doc, base_url=base, url_fetcher=fetch_resource).write_pdf(str(dest))
+        if failed_resources:
+            dest.unlink(missing_ok=True)
+            raise ValueError("document_resource_unavailable")
+        _validate_pdf_geometry(dest)
+        return _compact_sparse_single_page_pdf(dest)
+    except (ImportError, OSError) as e:
+        log.warning("weasyprint html->pdf skipped: %s", type(e).__name__)
+        # The reduced renderer cannot promise equivalent image/CSS rendering.
+        if "<img" in doc.lower() or "url(" in doc.lower():
+            raise ValueError("visual_document_renderer_unavailable") from e
+    _write_pdf_pymupdf_story(dest, doc)
+    _validate_pdf_geometry(dest)
+    return _compact_sparse_single_page_pdf(dest)
+
+
+def _validate_pdf_geometry(dest: Path) -> None:
+    """Reject lost glyphs and accidental trailing fragments, never crop them."""
+    import pymupdf
+
+    try:
+        with pymupdf.open(dest) as document:
+            for page in document:
+                flags = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_MEDIABOX_CLIP
+                spans = [span for block in page.get_text("dict", flags=flags, clip=pymupdf.INFINITE_RECT())["blocks"]
+                         for line in block.get("lines", []) for span in line.get("spans", [])
+                         if span.get("text", "").strip()]
+                for span in spans:
+                    x0, y0, x1, y1 = span["bbox"]
+                    if x0 < -1 or y0 < -1 or x1 > page.rect.width + 1 or y1 > page.rect.height + 1:
+                        raise ValueError("document_text_outside_page")
+                if page.number == len(document) - 1 and len(document) > 1 and spans and not page.get_image_info():
+                    height = max(span["bbox"][3] for span in spans) - min(span["bbox"][1] for span in spans)
+                    if height < page.rect.height * 0.15 and sum(len(span["text"]) for span in spans) < 500:
+                        raise ValueError("document_sparse_trailing_page")
+    except ValueError:
+        dest.unlink(missing_ok=True)
+        raise
+
+
+def _compact_sparse_single_page_pdf(dest: Path) -> Path:
+    """Crop accidental lower-page void from compact, text-bearing one-pagers.
+
+    Model-authored HTML can correctly use normal flow yet occupy only the upper
+    half of an A4 page. For a single-page information artifact with several
+    text blocks, preserve a deliberate footer margin and reduce the crop box.
+    Multi-page documents, image-only pages, and already balanced pages retain
+    their authored geometry.
+    """
+    try:
+        import pymupdf
+
+        doc = pymupdf.open(str(dest))
+        if len(doc) != 1:
+            doc.close()
+            return dest
+        page = doc[0]
+        if page.get_image_info():
+            doc.close()
+            return dest
+        page_height = float(page.rect.height)
+        blocks = [
+            block
+            for block in page.get_text("blocks")
+            if len(block) >= 5 and str(block[4] or "").strip()
+        ]
+        if len(blocks) < 4:
+            doc.close()
+            return dest
+        content_bottom = max(float(block[3]) for block in blocks)
+        if content_bottom >= page_height * 0.68:
+            doc.close()
+            return dest
+        target_height = max(page_height * 0.55, content_bottom + 36.0)
+        target_height = min(page_height, target_height)
+        page.set_cropbox(pymupdf.Rect(0, 0, float(page.rect.width), target_height))
+        tmp = dest.with_name(dest.stem + ".compact.pdf")
+        doc.save(str(tmp), garbage=3, deflate=True)
+        doc.close()
+        tmp.replace(dest)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("single-page PDF compaction skipped: %s", type(exc).__name__)
+    return dest
+
+
+def _write_pdf_pymupdf_story(dest: Path, html: str) -> Path:
+    """HTML→PDF via PyMuPDF Story (no GTK; good Unicode coverage)."""
+    import pymupdf
+
+    mediabox = pymupdf.paper_rect("a4")
+    where = mediabox + (36, 36, -36, -36)
+    story = pymupdf.Story(html=html)
+    writer = pymupdf.DocumentWriter(str(dest))
+    more = True
+    while more:
+        device = writer.begin_page(mediabox)
+        more, where = story.place(where)
+        story.draw(device)
+        writer.end_page()
+        where = mediabox + (36, 36, -36, -36)
+    writer.close()
+    return dest
+
+
+def _plain_body_to_presentation_html(body: str) -> str:
+    """Turn Label: value / title lines into a presentation HTML shell (WeasyPrint-safe)."""
+    title = ""
+    subtitle = ""
+    facts: list[tuple[str, str]] = []
+    prose: list[str] = []
+    for raw in (body or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith(("- ", "• ", "* ")):
+            line = line[2:].strip()
+        if ":" in line and not line.lower().startswith("http"):
+            label, _, value = line.partition(":")
+            label = label.strip()
+            value = value.strip()
+            if label and value and len(label) <= 40:
+                facts.append((label[:40], value[:80]))
+                continue
+        if not title:
+            title = line[:80]
+            continue
+        if not subtitle and len(line) <= 100:
+            subtitle = line
+            continue
+        prose.append(line)
+
+    def esc(s: str) -> str:
+        return (
+            (s or "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    parts: list[str] = []
+    if title or subtitle:
+        parts.append('<div class="band">')
+        if title:
+            parts.append(f"<h1>{esc(title)}</h1>")
+        if subtitle:
+            parts.append(f"<h2>{esc(subtitle)}</h2>")
+        parts.append("</div>")
+    # Pair facts into two-column table-rows
+    i = 0
+    while i < len(facts):
+        parts.append('<div class="cards">')
+        for lab, val in facts[i : i + 2]:
+            parts.append(
+                f'<div class="card"><div class="k">{esc(lab)}</div>'
+                f'<div class="v">{esc(val)}</div></div>'
+            )
+        parts.append("</div>")
+        i += 2
+    for p in prose[:12]:
+        parts.append(f"<p>{esc(p)}</p>")
+    if not parts:
+        parts.append("<p> </p>")
+    return "\n".join(parts)
+
+
+def write_pdf(dest: Path, body: str) -> Path:
+    """Write PDF from LLM HTML or raw/base64 PDF. No ReportLab page layout."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    pdf_blob = _decode_pdf_body(body)
+    if pdf_blob is not None:
+        dest.write_bytes(pdf_blob)
+        return dest
+    html = _extract_html(body)
+    if html:
+        return write_pdf_from_html(dest, html)
+    # Last resort: promote plain lines into a presentation HTML shell.
+    return write_pdf_from_html(dest, _plain_body_to_presentation_html(body or ""))
+
+
+def _structured_content(body: str) -> tuple[str, str, list[tuple[str, str]], list[tuple[str, list[str]]], list[str]]:
+    """Parse a general markdown-ish document without topic or language rules."""
+    title = ""
+    subtitle = ""
+    facts: list[tuple[str, str]] = []
+    sections: list[tuple[str, list[str]]] = []
+    prose: list[str] = []
+    section_name = ""
+    section_rows: list[str] = []
+
+    def flush() -> None:
+        nonlocal section_name, section_rows
+        if section_name or section_rows:
+            sections.append((section_name or "Details", list(section_rows)))
+        section_name = ""
+        section_rows = []
+
+    for raw in (body or "").splitlines():
+        line = _clean_inline_markdown(raw.strip())
+        if not line or _skip_structural_junk(line):
+            continue
+        if line.startswith("|") and line.endswith("|"):
+            continue
+        if line.startswith("#"):
+            count = 0
+            while count < len(line) and line[count] == "#":
+                count += 1
+            value = line[count:].strip()
+            if count == 1 and value and not title:
+                title = value
+            elif count == 2 and value and not subtitle and not sections:
+                subtitle = value
+            elif value:
+                flush()
+                section_name = value
+            continue
+        if line.startswith(("- ", "* ", "• ")):
+            value = line[2:].strip()
+            if section_name:
+                section_rows.append(value)
+            elif ":" in value:
+                label, _, fact = value.partition(":")
+                if label.strip() and fact.strip() and len(label.strip()) <= 60:
+                    facts.append((label.strip(), fact.strip()))
+                else:
+                    prose.append(value)
+            else:
+                prose.append(value)
+            continue
+        if ":" in line and not line.lower().startswith(("http://", "https://")):
+            label, _, fact = line.partition(":")
+            if label.strip() and fact.strip() and len(label.strip()) <= 60:
+                facts.append((label.strip(), fact.strip()))
+                continue
+        if section_name:
+            section_rows.append(line)
+        elif not title:
+            title = line
+        elif not subtitle and len(line) <= 180:
+            subtitle = line
+        else:
+            prose.append(line)
+    flush()
+    return title or "Document", subtitle, facts, sections, prose
+
+
+def _office_visual(body: str) -> tuple[str, Path | None]:
+    """Consume explicit image directives without interpreting user prose."""
+    lines: list[str] = []
+    references: list[str] = []
+    for line in body.splitlines():
+        if line.strip().startswith("IMAGE:"):
+            references.append(line.strip().partition(":")[2].strip())
+        elif not line.strip().startswith("LAYOUT:"):
+            lines.append(line)
+    if not references:
+        return "\n".join(lines), None
+    if len(references) != 1:
+        raise ValueError("office_visual_requires_one_asset")
+    visual = _resolve_media_path(references[0])
+    if visual is None or not any(visual.resolve().is_relative_to(root.resolve()) for root in _MEDIA_ROOTS):
+        raise ValueError("document_resource_unavailable")
+    from PIL import Image
+    with Image.open(visual) as image:
+        image.verify()
+    return "\n".join(lines), visual
+
+
+def write_docx_styled(dest: Path, body: str) -> Path:
+    """Create a readable, structured Word report from general authored content."""
+    from docx import Document
+    from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Cm, Pt, RGBColor
+
+    body, visual = _office_visual(body)
+    title, _subtitle, _facts, _sections, _prose = _structured_content(body)
+    doc = Document()
+    section = doc.sections[0]
+    section.top_margin = Cm(1.8)
+    section.bottom_margin = Cm(1.6)
+    section.left_margin = Cm(1.9)
+    section.right_margin = Cm(1.9)
+
+    normal = doc.styles["Normal"]
+    normal.font.name = "Inter"
+    normal.font.size = Pt(9.5)
+    normal.font.color.rgb = RGBColor(30, 45, 62)
+    normal.paragraph_format.space_after = Pt(4)
+    normal.paragraph_format.line_spacing = 1.05
+    for style_name, size, color in (
+        ("Title", 23, RGBColor(18, 67, 112)),
+        ("Heading 1", 15, RGBColor(18, 67, 112)),
+        ("Heading 2", 12, RGBColor(37, 112, 170)),
+    ):
+        style = doc.styles[style_name]
+        style.font.name = "Inter"
+        style.font.size = Pt(size)
+        style.font.color.rgb = color
+        style.font.bold = True
+        style.paragraph_format.left_indent = Cm(0)
+        style.paragraph_format.right_indent = Cm(0)
+        style.paragraph_format.keep_with_next = True
+
+    accent = doc.add_table(rows=1, cols=1)
+    accent.autofit = False
+    accent.columns[0].width = Cm(16.8)
+    cell = accent.cell(0, 0)
+    shade = OxmlElement("w:shd")
+    shade.set(qn("w:fill"), "1B5E8F")
+    cell._tc.get_or_add_tcPr().append(shade)
+    cell.text = " "
+    cell.paragraphs[0].paragraph_format.space_after = Pt(0)
+
+    p = doc.add_paragraph(style="Title")
+    p.paragraph_format.space_before = Pt(10)
+    p.paragraph_format.left_indent = Cm(0)
+    p.paragraph_format.right_indent = Cm(0)
+    p.add_run(title)
+    if visual is not None:
+        doc.add_picture(str(visual), width=section.page_width - section.left_margin - section.right_margin)
+
+    lines = (body or "").splitlines()
+    index = 0
+    title_consumed = False
+    while index < len(lines):
+        raw = lines[index].strip()
+        line = _clean_inline_markdown(raw)
+        index += 1
+        if not line or _skip_structural_junk(line):
+            continue
+        if line.startswith("|") and line.endswith("|") and line.count("|") >= 2:
+            rows: list[list[str]] = []
+            while True:
+                cells = [_clean_inline_markdown(cell) for cell in line[1:-1].split("|")]
+                compact = "".join(cells).replace("-", "").replace(":", "").replace(" ", "")
+                if compact:
+                    rows.append(cells)
+                if index >= len(lines):
+                    break
+                candidate = lines[index].strip()
+                if not (candidate.startswith("|") and candidate.endswith("|") and candidate.count("|") >= 2):
+                    break
+                line = candidate
+                index += 1
+            if rows:
+                column_count = max(len(row) for row in rows)
+                table = doc.add_table(rows=0, cols=column_count)
+                table.style = "Light Shading Accent 1"
+                for row_index, values in enumerate(rows):
+                    cells = table.add_row().cells
+                    for column_index in range(column_count):
+                        value = values[column_index] if column_index < len(values) else ""
+                        cells[column_index].vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+                        paragraph = cells[column_index].paragraphs[0]
+                        paragraph.paragraph_format.space_after = Pt(1)
+                        run = paragraph.add_run(value)
+                        run.font.size = Pt(9)
+                        if row_index == 0:
+                            run.bold = True
+                            run.font.color.rgb = RGBColor(18, 67, 112)
+                doc.add_paragraph()
+            continue
+        if line.startswith("#"):
+            level = 0
+            while level < len(line) and line[level] == "#":
+                level += 1
+            value = line[level:].strip()
+            if level == 1 and not title_consumed and value == title:
+                title_consumed = True
+                continue
+            if value:
+                doc.add_heading(value, level=1 if level <= 2 else 2)
+            continue
+        if line.startswith(("- ", "* ", "• ")):
+            doc.add_paragraph(line[2:].strip(), style="List Bullet")
+            continue
+        if not title_consumed and line == title:
+            title_consumed = True
+            continue
+        doc.add_paragraph(line)
+
+    footer = section.footer.paragraphs[0]
+    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    footer.add_run("•")
+    doc.save(dest)
+    return dest
+
+
+def write_xlsx_styled(dest: Path, body: str) -> Path:
+    """Create a presentation-ready workbook with a structured overview sheet."""
+    from openpyxl import Workbook
+    from openpyxl.chart import BarChart, Reference
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+    body, visual = _office_visual(body)
+    title, subtitle, facts, sections, prose = _structured_content(body)
+    authored_tables = _markdown_tables(body)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Overview"
+    if visual is not None:
+        from openpyxl.drawing.image import Image as SheetImage
+        picture = SheetImage(str(visual))
+        scale = min(1.0, 600.0 / picture.width, 380.0 / picture.height)
+        picture.width, picture.height = picture.width * scale, picture.height * scale
+        ws.add_image(picture, "F2")
+    navy = "174A73"
+    blue = "2A78B8"
+    pale = "EAF2F8"
+    ink = "182B3A"
+    white = "FFFFFF"
+    thin = Side(style="thin", color="C8D8E6")
+
+    ws.merge_cells("A1:D1")
+    ws["A1"] = title
+    ws["A1"].font = Font(name="Inter", size=22, bold=True, color=white)
+    ws["A1"].fill = PatternFill("solid", fgColor=navy)
+    ws["A1"].alignment = Alignment(vertical="center")
+    ws.row_dimensions[1].height = 42
+    row = 2
+    if subtitle:
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+        cell = ws.cell(row, 1, subtitle)
+        cell.font = Font(name="Inter", size=11, color="526A7E")
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[row].height = 30
+        row += 2
+    else:
+        row += 1
+
+    for label, value in facts:
+        ws.cell(row, 1, label)
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=4)
+        ws.cell(row, 2, value)
+        for col in range(1, 5):
+            cell = ws.cell(row, col)
+            cell.fill = PatternFill("solid", fgColor=pale if row % 2 else white)
+            cell.border = Border(bottom=thin)
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+            cell.font = Font(name="Inter", size=10.5, color=ink, bold=col == 1)
+        ws.cell(row, 1).font = Font(name="Inter", size=10.5, bold=True, color=blue)
+        ws.row_dimensions[row].height = 28
+        row += 1
+
+    chart_source: tuple[int, int, int] | None = None
+    for rows in authored_tables:
+        row += 1
+        table_start = row
+        column_count = min(max(len(values) for values in rows), 12)
+        for row_index, values in enumerate(rows):
+            for column_index in range(column_count):
+                value = values[column_index] if column_index < len(values) else ""
+                cell = ws.cell(row, column_index + 1, value)
+                cell.alignment = Alignment(wrap_text=True, vertical="center")
+                cell.border = Border(bottom=thin)
+                if row_index == 0:
+                    cell.fill = PatternFill("solid", fgColor=blue)
+                    cell.font = Font(name="Inter", size=10.5, bold=True, color=white)
+                else:
+                    cell.font = Font(name="Inter", size=10.5, color=ink)
+            ws.row_dimensions[row].height = 28
+            row += 1
+        if len(rows) >= 3 and column_count >= 2:
+            chart_source = (table_start, row - 1, column_count)
+
+    if prose:
+        row += 1
+        for text in prose:
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+            cell = ws.cell(row, 1, text)
+            cell.font = Font(name="Inter", size=10.5, color=ink)
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.row_dimensions[row].height = 34
+            row += 1
+    for heading, rows in sections:
+        row += 1
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+        cell = ws.cell(row, 1, heading)
+        cell.fill = PatternFill("solid", fgColor=blue)
+        cell.font = Font(name="Inter", size=13, bold=True, color=white)
+        cell.alignment = Alignment(vertical="center")
+        ws.row_dimensions[row].height = 26
+        row += 1
+        for value in rows:
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+            cell = ws.cell(row, 1, f"• {value}")
+            cell.font = Font(name="Inter", size=10.5, color=ink)
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+            cell.border = Border(bottom=thin)
+            ws.row_dimensions[row].height = 30
+            row += 1
+
+    for column, width in {"A": 25, "B": 24, "C": 24, "D": 24}.items():
+        ws.column_dimensions[column].width = width
+    ws.freeze_panes = "A3"
+    ws.sheet_view.showGridLines = False
+    ws.print_title_rows = "1:2"
+    ws.page_setup.fitToWidth = 1
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    if chart_source:
+        header_row, last_row, last_column = chart_source
+        numeric_column = 0
+        for column in range(last_column, 1, -1):
+            numeric = 0
+            for row_index in range(header_row + 1, last_row + 1):
+                raw = str(ws.cell(row_index, column).value or "").strip()
+                cleaned = "".join(ch for ch in raw if ch.isdigit() or ch in ".,-")
+                if cleaned and any(ch.isdigit() for ch in cleaned):
+                    numeric += 1
+            if numeric >= 2:
+                numeric_column = column
+                break
+        if numeric_column:
+            chart = BarChart()
+            chart.type = "col"
+            chart.style = 10
+            chart.title = str(ws.cell(header_row, numeric_column).value or "Overview")
+            chart.height = 7
+            chart.width = 12
+            data = Reference(ws, min_col=numeric_column, min_row=header_row, max_row=last_row)
+            categories = Reference(ws, min_col=1, min_row=header_row + 1, max_row=last_row)
+            chart.add_data(data, titles_from_data=True)
+            chart.set_categories(categories)
+            ws.add_chart(chart, f"F{header_row}")
+    wb.save(dest)
+    return dest
+
+
+def write_pptx_styled(dest: Path, body: str) -> Path:
+    """Markdown-ish body → title + facts/sections PPTX deck (presentation-ready)."""
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.enum.text import PP_ALIGN
+    from pptx.oxml.xmlchemy import OxmlElement
+    from pptx.util import Inches, Pt
+
+    title = ""
+    subtitle = ""
+    facts: list[str] = []
+    prose: list[str] = []
+    sections: list[tuple[str, list[str]]] = []
+    cur_section = ""
+    cur_bullets: list[str] = []
+    image_ref = ""
+    layout = "full-bleed"
+
+    def flush_section() -> None:
+        nonlocal cur_section, cur_bullets
+        if cur_section or cur_bullets:
+            sections.append((cur_section or "Chi tiết", list(cur_bullets)))
+        cur_section = ""
+        cur_bullets = []
+
+    for raw in (body or "").splitlines():
+        line = _clean_inline_markdown(raw.strip())
+        if not line:
+            continue
+        low = line.lower()
+        if low.startswith("image:"):
+            # Asset paths are opaque data. Markdown cleanup would corrupt a
+            # legitimate filename containing double underscores/backticks.
+            image_ref = raw.strip().split(":", 1)[1].strip()
+            continue
+        if low.startswith("layout:"):
+            requested = line.split(":", 1)[1].strip().lower()
+            if requested in {"full-bleed", "image-left", "image-right", "minimal"}:
+                layout = requested
+            continue
+        if line.startswith("#"):
+            hashes = 0
+            while hashes < len(line) and line[hashes] == "#":
+                hashes += 1
+            rest = line[hashes:].strip()
+            if hashes == 1 and rest and not title:
+                title = rest
+                continue
+            if rest:
+                flush_section()
+                cur_section = rest
+            continue
+        if low.startswith("subtitle:"):
+            subtitle = line.split(":", 1)[1].strip()
+            continue
+        if line.startswith(("- ", "• ", "* ")):
+            item = line[2:].strip()
+            if item and not _skip_structural_junk(item):
+                if cur_section:
+                    cur_bullets.append(item)
+                else:
+                    facts.append(item)
+            continue
+        if _skip_structural_junk(line):
+            continue
+        if cur_section:
+            cur_bullets.append(line)
+        else:
+            prose.append(line)
+
+    flush_section()
+    if not title:
+        title = prose.pop(0) if prose else "Báo cáo"
+    if 1 + bool(facts or prose) + len(sections) > 100:
+        raise ValueError("document_page_limit_exceeded")
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+
+    def _fill_para(para, text: str, *, size: int, bold: bool = False, color=(16, 32, 56)) -> None:
+        para.text = text
+        for run in para.runs:
+            run.font.size = Pt(size)
+            run.font.bold = bold
+            run.font.color.rgb = RGBColor(*color)
+            run.font.name = "Inter"
+
+    def _text_size(rows: list[str], width: float, height: float, preferred: int, minimum: int, *, bold: bool = False) -> int:
+        """Measure complete copy with the installed font; reject rather than truncate."""
+        from PIL import ImageFont
+        from fonts import resolve_font_path
+
+        path = resolve_font_path(bold=bold, family="inter")
+        for size in range(preferred, minimum - 1, -1):
+            font = ImageFont.truetype(path, size=size * 4)
+            available = (width * 72 - 18) * 4
+            lines = 0
+            fits = True
+            for row in rows:
+                for segment in row.splitlines() or [""]:
+                    current = ""
+                    lines += 1
+                    for word in segment.split():
+                        if font.getlength(word) > available:
+                            fits = False
+                            break
+                        candidate = (current + " " + word).strip()
+                        if current and font.getlength(candidate) > available:
+                            lines += 1
+                            current = word
+                        else:
+                            current = candidate
+            if fits and lines * size * 1.45 + len(rows) * 4 <= height * 72 - 18:
+                return size
+        raise ValueError("document_text_overflow")
+
+    def _resolved_image() -> Path | None:
+        if not image_ref:
+            return None
+        return _resolve_media_path(image_ref)
+
+    visual = _resolved_image()
+    if image_ref and visual is None:
+        raise ValueError("document_resource_unavailable")
+
+    def _add_cover(slide) -> bool:
+        if visual is None or not visual.is_file():
+            return False
+        try:
+            from PIL import Image
+
+            with Image.open(visual) as source:
+                iw, ih = source.size
+            slide_ar = float(prs.slide_width) / float(prs.slide_height)
+            image_ar = float(iw) / float(max(1, ih))
+            if image_ar >= slide_ar:
+                height = prs.slide_height
+                width = int(height * image_ar)
+                left = int((prs.slide_width - width) / 2)
+                top = 0
+            else:
+                width = prs.slide_width
+                height = int(width / image_ar)
+                left = 0
+                top = int((prs.slide_height - height) / 2)
+            slide.shapes.add_picture(str(visual), left, top, width=width, height=height)
+            return True
+        except Exception:
+            log.warning("pptx visual could not be embedded", exc_info=True)
+            raise ValueError("document_resource_unavailable") from None
+
+    def _paint_bg(slide, rgb=(238, 243, 248), *, scenic: bool = False) -> bool:
+        has_visual = bool(scenic and layout == "full-bleed" and _add_cover(slide))
+        if has_visual:
+            shade = slide.shapes.add_shape(
+                MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), prs.slide_width, prs.slide_height
+            )
+            shade.fill.solid()
+            shade.fill.fore_color.rgb = RGBColor(8, 18, 32)
+            # FillFormat has no transparency property. An arbitrary Python
+            # attribute would leave an opaque rectangle hiding the entire photo.
+            alpha = OxmlElement("a:alpha")
+            alpha.set("val", "62000")
+            shade._element.spPr.solidFill.srgbClr.append(alpha)
+            shade.line.fill.background()
+            return True
+        shape = slide.shapes.add_shape(
+            MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), prs.slide_width, prs.slide_height
+        )
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = RGBColor(*rgb)
+        shape.line.fill.background()
+        return False
+
+    def _add_split_visual(slide) -> tuple[float, float]:
+        if visual is None or layout not in {"image-left", "image-right"}:
+            return 0.7, 12.0
+        pic_left = 0.0 if layout == "image-left" else 7.65
+        slide.shapes.add_picture(str(visual), Inches(pic_left), Inches(0), width=Inches(5.68), height=Inches(7.5))
+        if layout == "image-left":
+            return 6.05, 6.65
+        return 0.7, 6.55
+
+    def _accent_bar(slide) -> None:
+        bar = slide.shapes.add_shape(
+            MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(0.22), prs.slide_height
+        )
+        bar.fill.solid()
+        bar.fill.fore_color.rgb = RGBColor(26, 58, 102)
+        bar.line.fill.background()
+
+    def _add_bullets(slide, heading: str, items: list[str]) -> None:
+        scenic = _paint_bg(slide, scenic=True)
+        _accent_bar(slide)
+        left, width = _add_split_visual(slide) if not scenic else (0.7, 12.0)
+        heading_color = (255, 255, 255) if scenic else (26, 58, 102)
+        body_color = (245, 248, 252) if scenic else (20, 40, 60)
+        h = slide.shapes.add_textbox(Inches(left), Inches(0.4), Inches(width), Inches(0.7))
+        h.text_frame.word_wrap = True
+        _fill_para(h.text_frame.paragraphs[0], heading, size=_text_size([heading], width, 0.7, 26, 18, bold=True), bold=True, color=heading_color)
+        body_box = slide.shapes.add_textbox(Inches(left), Inches(1.3), Inches(width), Inches(5.5))
+        btf = body_box.text_frame
+        btf.word_wrap = True
+        first = True
+        size = _text_size([f"• {item}" for item in items], width, 5.5, 20, 16)
+        for item in items:
+            para = btf.paragraphs[0] if first else btf.add_paragraph()
+            first = False
+            para.space_after = Pt(4)
+            para.line_spacing = 1.2
+            _fill_para(para, f"• {item}", size=size, color=body_color)
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    scenic_title = _paint_bg(slide, (26, 58, 102), scenic=True)
+    title_left, title_width = _add_split_visual(slide) if not scenic_title else (0.9, 11.5)
+    box = slide.shapes.add_textbox(Inches(title_left), Inches(2.4), Inches(title_width), Inches(1.4))
+    tf = box.text_frame
+    tf.word_wrap = True
+    p = tf.paragraphs[0]
+    p.alignment = PP_ALIGN.LEFT
+    _fill_para(p, title, size=_text_size([title], title_width, 1.4, 40, 24, bold=True), bold=True, color=(255, 255, 255) if scenic_title or visual is None else (26, 58, 102))
+    if subtitle:
+        sub = slide.shapes.add_textbox(Inches(title_left), Inches(4.0), Inches(title_width), Inches(0.8))
+        _fill_para(
+            sub.text_frame.paragraphs[0],
+            subtitle,
+            size=_text_size([subtitle], title_width, 0.8, 18, 16),
+            bold=False,
+            color=(207, 224, 245) if scenic_title or visual is None else (55, 80, 110),
+        )
+
+    if facts or prose:
+        _add_bullets(prs.slides.add_slide(prs.slide_layouts[6]), title, facts + prose)
+
+    for sec_title, rows in sections:
+        _add_bullets(prs.slides.add_slide(prs.slide_layouts[6]), sec_title, rows)
+
+    prs.save(str(dest))
+    return dest
+
+
+def write_office(dest: Path, ext: str, body: str) -> Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if ext in {".txt", ".md", ".csv"}:
+        data = body if body.endswith("\n") else body + "\n"
+        dest.write_text(data, encoding="utf-8")
+        return dest
+    if ext == ".xlsx":
+        return write_xlsx_styled(dest, body)
+    if ext == ".docx":
+        return write_docx_styled(dest, body)
+    if ext == ".pdf":
+        return write_pdf(dest, body)
+    if ext == ".pptx":
+        return write_pptx_styled(dest, body)
+    dest.write_text(body + "\n", encoding="utf-8")
+    return dest
+
+
+def _draft_review(dest: Path, media_dir: Path) -> dict[str, Any] | None:
+    """Return bounded native print text and private page images, never OCR."""
+    if dest.suffix.lower() not in {".pdf", ".docx", ".xlsx", ".pptx"}:
+        return None
+    import pymupdf
+    from file_convert import ConvertReq, convert_file
+
+    preview_dir = dest.parent / ".preview"
+    preview_dir.mkdir()
+    images, _ = convert_file(ConvertReq(source_path=str(dest), output_type="png", dpi=96), preview_dir)
+    pdf = preview_dir / (dest.stem + ".pdf")
+    pages = []
+    with pymupdf.open(pdf) as document:
+        for page, image in zip(document, images):
+            pages.append({"number": page.number + 1, "text": page.get_text(),
+                "width_pt": page.rect.width, "height_pt": page.rect.height,
+                "image_path": str(Path("/opt/data/media") / image.relative_to(media_dir))})
+    if sum(len(page["text"]) for page in pages) > 131072:
+        raise ValueError("document_review_text_limit")
+    return {"page_count": len(pages), "pages": pages}
+
+
+def register_office_file(
+    app: Any,
+    media_dir: Path,
+    deliver: Callable[..., dict[str, Any]],
+) -> None:
+    from fastapi import HTTPException
+
+    @app.post("/v1/office-file")
+    def office_file(req: OfficeFileReq) -> dict[str, Any]:
+        if not _enabled():
+            raise HTTPException(
+                503,
+                os.environ.get(
+                    "OFFICE_DISABLED_MESSAGE",
+                    "Office file generation is unavailable.",
+                ),
+            )
+        prompt = (req.prompt or "").strip()
+        if not prompt:
+            raise HTTPException(400, "prompt required")
+        if req.send_zalo and not req.thread_id:
+            raise HTTPException(400, "thread_id required")
+        if req.draft and req.send_zalo:
+            raise HTTPException(400, "draft cannot be delivered")
+
+        jobs = parse_office_jobs(prompt, req.output_type or "")
+        if not jobs:
+            raise HTTPException(400, "prompt required")
+        for ext, _body in jobs:
+            if ext not in _OFFICE_OK:
+                raise HTTPException(400, f"unsupported {ext}")
+        # A renderer cannot certify copy, evidence or visual quality. Keep
+        # formatted artifacts private until the caller reviews their actual
+        # pages and explicitly selects the existing artifact for delivery.
+        if not req.draft and any(ext in {".pdf", ".pptx", ".docx", ".xlsx"} for ext, _ in jobs):
+            raise HTTPException(409, "document_preview_required: use draft=true, send_zalo=false; review pages before send-file")
+
+        caption = (req.caption if req.caption is not None else "").strip()
+        base_name = (req.filename or "").strip()
+        files: list[dict[str, Any]] = []
+        zalo: Any = None
+        zalo_error: Any = None
+
+        for i, (ext, body) in enumerate(jobs):
+            review = None
+            if base_name and len(jobs) == 1:
+                name = base_name
+            elif base_name and len(jobs) > 1:
+                name = f"{Path(base_name).stem}-{i + 1}{ext}"
+            else:
+                name = f"file-{uuid.uuid4().hex[:8]}{ext}"
+            if Path(name).suffix.lower() != ext:
+                name = f"{Path(name).stem}{ext}"
+            output_dir = media_dir / "out"
+            if req.draft:
+                output_dir = output_dir / ".drafts" / uuid.uuid4().hex
+                output_dir.mkdir(parents=True, exist_ok=True)
+            dest = output_dir / Path(name).name
+            # Publish only a fully rendered file. Live watchers must not see
+            # a partial PDF or a document rejected for missing resources.
+            build_dir = media_dir / "out" / ".build" / uuid.uuid4().hex
+            build_dir.mkdir(parents=True, exist_ok=True)
+            staged = build_dir / dest.name
+            try:
+                staged = write_office(staged, ext, body)
+                staged.replace(dest)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            finally:
+                for remaining in build_dir.iterdir():
+                    if remaining.is_file():
+                        remaining.unlink()
+                build_dir.rmdir()
+            if req.send_zalo:
+                try:
+                    zalo = deliver(
+                        path=str(dest),
+                        thread_id=req.thread_id,
+                        thread_type=req.thread_type or "user",
+                        caption=caption,
+                        filename=dest.name,
+                        lock_thread=True,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    zalo_error = str(getattr(e, "detail", None) or e)[:300]
+                    log.warning(
+                        "office-file wrote %s but zalo send failed: %s",
+                        dest.name,
+                        type(e).__name__,
+                    )
+            if req.draft:
+                try:
+                    review = _draft_review(dest, media_dir)
+                except ValueError as exc:
+                    raise HTTPException(422, str(exc)) from exc
+                except OSError as exc:
+                    raise HTTPException(503, "document_preview_renderer_unavailable") from exc
+                except subprocess.TimeoutExpired as exc:
+                    raise HTTPException(504, "document_preview_timeout") from exc
+                except subprocess.CalledProcessError as exc:
+                    raise HTTPException(422, "document_preview_engine_failed") from exc
+            files.append(
+                {
+                    "file": dest.name,
+                    "path": str(dest),
+                    "hermes_path": str(Path("/opt/data/media") / dest.relative_to(media_dir)),
+                    "ext": dest.suffix.lower(),
+                    "zalo": zalo,
+                    "zalo_error": zalo_error,
+                    "review": review,
+                }
+            )
+
+        first = files[0]
+        return {
+            "ok": True,
+            "file": first["file"],
+            "path": first["path"],
+            "hermes_path": first["hermes_path"],
+            "ext": first["ext"],
+            "files": files,
+            "zalo": first.get("zalo"),
+            "zalo_error": first.get("zalo_error"),
+            "review": first.get("review"),
+        }
